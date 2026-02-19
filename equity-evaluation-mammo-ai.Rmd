@@ -1,0 +1,444 @@
+---
+title: "Aequity-evaluation-mammo-ai"
+author: "Hyemi"
+date: "2026-02-05"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# Fix: set CRAN mirror so install.packages() works during knitting
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+pkgs <- c(
+  "dplyr","readr","knitr","pROC","ggplot2","scales",
+  "broom","tidyr","forcats"
+)
+
+need <- setdiff(pkgs, rownames(installed.packages()))
+if(length(need) > 0) install.packages(need)
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+# 1 Background and objectives
+
+## 1.1 Background
+
+This project evaluates whether a mammography AI algorithm’s cancer detection score performs **consistently across demographic subgroups**.
+Using a simulated screening dataset (N = 5,000), we quantify:
+
+- **Discrimination:** how well the AI score separates cancer vs non-cancer (AUC-ROC).
+- **Calibration:** whether the score behaves like a probability (predicted risk matches observed cancer rates).
+- **Potential structure/confounding:** whether region- and vendor-related differences may influence apparent subgroup differences.
+
+*Note:* In many real systems, a model output may be a ranking/suspicion score rather than a calibrated probability. In that case, high AUC can coexist with imperfect calibration.
+
+## 1.2 Objectives
+
+- Estimate overall and subgroup AUC-ROC (ethnicity, SES, and ethnicity × SES).
+- Compare subgroup AUCs to reference groups (Swedish; High SES) using DeLong tests.
+- Assess overall and subgroup calibration using calibration curves, Brier score, and Expected Calibration Error (ECE).
+- Examine whether associations persist after adjustment for region/vendor/age/density.
+
+# 2 Data & preprocessing
+
+```{r data_processing}
+# GitHub-friendly: relative paths (repo root)
+data_path <- file.path("data", "mammography_ai_equity_data_simulated.csv")
+stopifnot(file.exists(data_path))
+
+data_original <- readr::read_csv(data_path, show_col_types = FALSE)
+
+# Type casting + derived intersectional subgroup
+data_original <- data_original %>%
+  mutate(
+    cancer = as.integer(cancer),
+    ethnicity = as.factor(ethnicity),
+    ses = factor(ses, levels = c("Low","Medium","High")),
+    region = as.factor(region),
+    vendor = as.factor(mammography_vendor),     # anonymized A/B/C/D
+    density = factor(breast_density, levels = c("A","B","C","D")),
+    eth_ses = interaction(ethnicity, ses, drop = TRUE, sep = "/")
+  ) %>%
+  select(-mammography_vendor, -breast_density)
+
+knitr::kable(
+  data_original %>% summarise(across(everything(), ~sum(is.na(.)))),
+  caption = "Missing values per variable"
+)
+```
+
+Preprocessing summary:
+
+- Cast categorical variables as factors and ensured `cancer` is a 0/1 integer.
+- Created `eth_ses` (ethnicity × SES) for intersectional summaries.
+- Confirmed no missingness in the analytic variables.
+
+## 2.1 Subgroup sizes
+
+```{r subgroup_sizes}
+by_eth <- data_original %>%
+  group_by(ethnicity) %>%
+  summarise(n=n(), cases=sum(cancer), prev=mean(cancer), .groups="drop")
+
+by_ses <- data_original %>%
+  group_by(ses) %>%
+  summarise(n=n(), cases=sum(cancer), prev=mean(cancer), .groups="drop")
+
+by_int <- data_original %>%
+  group_by(eth_ses) %>%
+  summarise(n=n(), cases=sum(cancer), prev=mean(cancer), .groups="drop")
+
+kable(by_eth, digits=3, caption="Group size by ethnicity")
+kable(by_ses, digits=3, caption="Group size by SES")
+kable(by_int, digits=3, caption="Group size by ethnicity × SES")
+```
+
+# 3 Discrimination (AUC-ROC)
+
+## 3.1 Overall AUC
+
+```{r auc_overall}
+roc_all <- roc(response = data_original$cancer, predictor = data_original$ai_score, quiet=TRUE)
+auc_all <- auc(roc_all)
+ci_all <- ci.auc(roc_all, method="delong")
+
+tibble(
+  auc = as.numeric(auc_all),
+  ci_low = as.numeric(ci_all)[1],
+  ci_high = as.numeric(ci_all)[3]
+) %>%
+  kable(digits=3, caption="Overall AUC (DeLong 95% CI)")
+
+roc_df <- tibble(
+  fpr = 1 - roc_all$specificities,
+  tpr = roc_all$sensitivities
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  geom_line(linewidth=1) +
+  coord_equal(xlim=c(0,1), ylim=c(0,1)) +
+  labs(
+    title = "Overall ROC curve",
+    subtitle = paste0(
+      "AUC = ", round(as.numeric(auc_all), 3),
+      " (95% CI ", round(as.numeric(ci_all)[1],3), "–", round(as.numeric(ci_all)[3],3), ")"
+    ),
+    x = "False positive rate (1 - specificity)",
+    y = "True positive rate (sensitivity)"
+  ) +
+  theme_classic(base_size = 12)
+```
+
+Interpretation: Discrimination is very high in this simulated dataset (AUC close to 1), meaning the score ranks cancer cases above non-cases very consistently.
+
+## 3.2 Subgroup AUCs
+
+```{r auc_subgroups}
+get_auc_ci <- function(df){
+  r <- roc(df$cancer, df$ai_score, quiet=TRUE)
+  c(
+    auc = as.numeric(auc(r)),
+    ci_low = as.numeric(ci.auc(r, method="delong"))[1],
+    ci_high = as.numeric(ci.auc(r, method="delong"))[3]
+  )
+}
+
+auc_ethnicity <- data_original %>%
+  group_by(ethnicity) %>%
+  group_modify(~{
+    m <- get_auc_ci(.x)
+    tibble(
+      n = nrow(.x),
+      cases = sum(.x$cancer),
+      auc = m["auc"],
+      ci_low = m["ci_low"],
+      ci_high = m["ci_high"]
+    )
+  }) %>%
+  ungroup()
+
+auc_ses <- data_original %>%
+  group_by(ses) %>%
+  group_modify(~{
+    m <- get_auc_ci(.x)
+    tibble(
+      n = nrow(.x),
+      cases = sum(.x$cancer),
+      auc = m["auc"],
+      ci_low = m["ci_low"],
+      ci_high = m["ci_high"]
+    )
+  }) %>%
+  ungroup()
+
+min_cases <- 20
+auc_int <- data_original %>%
+  group_by(ethnicity, ses) %>%
+  filter(sum(cancer) >= min_cases, sum(1-cancer) >= min_cases) %>%
+  group_modify(~{
+    m <- get_auc_ci(.x)
+    tibble(
+      n = nrow(.x),
+      cases = sum(.x$cancer),
+      auc = m["auc"],
+      ci_low = m["ci_low"],
+      ci_high = m["ci_high"]
+    )
+  }) %>%
+  ungroup()
+
+kable(auc_ethnicity, digits=3, caption="AUC by ethnicity (DeLong 95% CI)")
+kable(auc_ses, digits=3, caption="AUC by SES (DeLong 95% CI)")
+kable(auc_int, digits=3,
+      caption=paste0("AUC by ethnicity × SES (cells with ≥", min_cases, " cases and non-cases)") )
+
+ggplot(auc_ethnicity %>% mutate(ethnicity = reorder(ethnicity, auc)),
+       aes(x = auc, y = ethnicity)) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2) +
+  geom_point(size = 2.3) +
+  geom_vline(xintercept = as.numeric(auc_all), linetype="dashed") +
+  coord_cartesian(xlim = c(0.9, 1)) +
+  labs(
+    title = "Discrimination by ethnicity",
+    subtitle = "Points: AUC; bars: 95% CI (DeLong). Dashed line: overall AUC.",
+    x = "AUC-ROC",
+    y = NULL
+  ) +
+  theme_classic(base_size = 12)
+```
+
+## 3.3 AUC comparisons vs reference groups
+
+```{r delong_tests}
+# Ethnicity vs Swedish
+sw <- subset(data_original, ethnicity == "Swedish")
+roc_sw <- roc(sw$cancer, sw$ai_score, quiet = TRUE)
+
+groups_eth <- setdiff(levels(data_original$ethnicity), "Swedish")
+res_delong <- tibble(ethnicity = character(), p_value = numeric())
+
+for(gname in groups_eth){
+  gdat <- subset(data_original, ethnicity == gname)
+  if(length(unique(gdat$cancer)) < 2) next
+  roc_g <- roc(gdat$cancer, gdat$ai_score, quiet = TRUE)
+  p <- roc.test(roc_g, roc_sw, method = "delong", paired = FALSE)$p.value
+  res_delong <- bind_rows(res_delong, tibble(ethnicity = gname, p_value = p))
+}
+
+res_delong <- res_delong %>% mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+kable(res_delong, digits = 4,
+      caption = "DeLong test p-values: AUC difference vs Swedish reference (BH adjusted)")
+
+# SES vs High
+ref <- subset(data_original, ses == "High")
+roc_ref <- roc(ref$cancer, ref$ai_score, quiet = TRUE)
+
+groups_ses <- setdiff(levels(data_original$ses), "High")
+res_delong_ses <- tibble(ses = character(), p_value = numeric())
+
+for(gname in groups_ses){
+  gdat <- subset(data_original, ses == gname)
+  if(length(unique(gdat$cancer)) < 2) next
+  roc_g <- roc(gdat$cancer, gdat$ai_score, quiet = TRUE)
+  p <- roc.test(roc_g, roc_ref, method = "delong", paired = FALSE)$p.value
+  res_delong_ses <- bind_rows(res_delong_ses, tibble(ses = gname, p_value = p))
+}
+
+res_delong_ses <- res_delong_ses %>% mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+kable(res_delong_ses, digits = 4,
+      caption = "DeLong test p-values: AUC difference vs High SES reference (BH adjusted)")
+```
+
+# 4 Calibration
+
+## 4.1 Overall calibration
+
+```{r calibration_overall}
+
+n_bins <- 10
+
+data_original$bin <- cut(
+  data_original$ai_score,
+  breaks = seq(0, 1, length.out = n_bins + 1),
+  include.lowest = TRUE
+)
+
+cal_overall <- data_original %>%
+  group_by(bin) %>%
+  summarise(n = n(), obs = mean(cancer), pred = mean(ai_score), .groups = "drop")
+
+brier_overall <- mean((data_original$ai_score - data_original$cancer)^2)
+
+ece_overall <- cal_overall %>%
+  mutate(w = n/sum(n), gap = abs(obs - pred)) %>%
+  summarise(ece = sum(w*gap)) %>%
+  pull(ece)
+
+kable(cal_overall, digits=4, caption="Overall calibration table (10 equal-width bins)")
+kable(tibble(Brier = brier_overall, ECE_10bins = ece_overall), digits=4,
+      caption="Overall calibration summary")
+
+ggplot(cal_overall, aes(x = pred, y = obs)) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  geom_line(linewidth=1) +
+  geom_point(size=2) +
+  coord_equal(xlim=c(0,1), ylim=c(0,1)) +
+  labs(
+    title = "Calibration curve (overall)",
+    subtitle = paste0(
+      "Brier = ", round(brier_overall, 4),
+      ", ECE(10 bins) = ", round(ece_overall, 4)
+    ),
+    x = "Mean predicted risk (ai_score)",
+    y = "Observed cancer rate"
+  ) +
+  theme_classic(base_size = 12)
+```
+
+Interpretation: Despite very strong discrimination, calibration is not perfect (non-trivial ECE). This is consistent with a score that is primarily optimized for ranking.
+
+## 4.2 Calibration by subgroup
+
+```{r calibration_subgroups}
+cal_eth <- data_original %>%
+  group_by(ethnicity, bin) %>%
+  summarise(n=n(), obs=mean(cancer), pred=mean(ai_score), .groups="drop")
+
+ggplot(cal_eth, aes(pred, obs)) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  geom_line() +
+  geom_point(size=1.5) +
+  coord_equal(xlim=c(0,1), ylim=c(0,1)) +
+  facet_wrap(~ ethnicity) +
+  labs(title = "Calibration curves by ethnicity",
+       x = "Mean predicted risk", y = "Observed rate") +
+  theme_classic(base_size = 11)
+
+brier_eth <- data_original %>%
+  group_by(ethnicity) %>%
+  summarise(
+    n = n(),
+    cases = sum(cancer),
+    brier = mean((ai_score - cancer)^2),
+    .groups = "drop"
+  ) %>% arrange(desc(brier))
+
+ece_eth <- cal_eth %>%
+  group_by(ethnicity) %>%
+  summarise(
+    ece = sum((n/sum(n)) * abs(obs - pred)),
+    .groups = "drop"
+  ) %>% arrange(desc(ece))
+
+kable(brier_eth, digits=4, caption="Brier score by ethnicity")
+kable(ece_eth, digits=4, caption="ECE by ethnicity (10 bins)")
+
+cal_ses <- data_original %>%
+  group_by(ses, bin) %>%
+  summarise(n=n(), obs=mean(cancer), pred=mean(ai_score), .groups="drop")
+
+ggplot(cal_ses, aes(pred, obs)) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  geom_line() +
+  geom_point(size=1.5) +
+  coord_equal(xlim=c(0,1), ylim=c(0,1)) +
+  facet_wrap(~ ses) +
+  labs(title = "Calibration curves by SES",
+       x = "Mean predicted risk", y = "Observed rate") +
+  theme_classic(base_size = 11)
+
+brier_ses <- data_original %>%
+  group_by(ses) %>%
+  summarise(
+    n = n(),
+    cases = sum(cancer),
+    brier = mean((ai_score - cancer)^2),
+    .groups = "drop"
+  ) %>% arrange(desc(brier))
+
+ece_ses <- cal_ses %>%
+  group_by(ses) %>%
+  summarise(
+    ece = sum((n/sum(n)) * abs(obs - pred)),
+    .groups = "drop"
+  ) %>% arrange(desc(ece))
+
+kable(brier_ses, digits=4, caption="Brier score by SES")
+kable(ece_ses, digits=4, caption="ECE by SES (10 bins)")
+```
+
+# 5 Confounding and adjustment
+
+## 5.1 Multivariable adjustment models
+
+```{r adjustment_models}
+data_original <- data_original %>%
+  mutate(
+    ethnicity = relevel(ethnicity, ref = "Swedish"),
+    ses = relevel(ses, ref = "High")
+  )
+
+m0 <- glm(cancer ~ ai_score + ethnicity + ses,
+          data = data_original, family = binomial())
+
+m1 <- glm(cancer ~ ai_score + ethnicity + ses + region + vendor,
+          data = data_original, family = binomial())
+
+m2 <- glm(cancer ~ ai_score + ethnicity + ses + region + vendor + age + density,
+          data = data_original, family = binomial())
+
+tidy_or <- function(fit, label){
+  broom::tidy(fit, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(model = label) %>%
+    select(model, term, estimate, conf.low, conf.high, p.value)
+}
+
+tab <- bind_rows(
+  tidy_or(m0, "M0: + ethnicity + SES"),
+  tidy_or(m1, "M1: + region + vendor"),
+  tidy_or(m2, "M2: + age + density")
+) %>%
+  filter(
+    term %in% c("ai_score",
+               "ethnicityAfrican","ethnicityAsian","ethnicityOther","ethnicityOther European",
+               "sesLow","sesMedium")
+  ) %>%
+  mutate(
+    OR_CI = paste0(round(estimate, 3), " (", round(conf.low, 3), "–", round(conf.high, 3), ")"),
+    p = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  ) %>%
+  select(model, term, OR_CI, p)
+
+kable(tab, caption = "Adjusted odds ratios (OR, 95% CI) across models")
+```
+
+# 6 Key findings, limitations, and next steps
+
+## 6.1 Key findings
+
+- **Discrimination:** Overall AUC is very high; subgroup AUCs are similarly high with small absolute differences.
+- **Calibration:** Overall miscalibration is present (ECE), with some subgroup variation in Brier/ECE.
+- **Adjustment:** After accounting for region/vendor (and age/density), the AI score remains strongly predictive; demographic terms can indicate group shifts at a fixed score (consistent with subgroup miscalibration or simulation-imposed shifts).
+
+## 6.2 Practical relevance
+
+When discrimination is near-perfect, **calibration and threshold-based metrics** become more informative for operational decisions (e.g., recall thresholds). A model can rank well (high AUC) but still over-/under-estimate risk in specific groups.
+
+## 6.3 Limitations
+
+- Some minority and intersectional subgroups are small; intersectional comparisons are less stable.
+- Calibration metrics depend on binning; ECE can change with the binning strategy.
+- The data are simulated; results illustrate an evaluation workflow rather than real-world performance.
