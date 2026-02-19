@@ -55,3 +55,8 @@ Do not interpret results as medical evidence.
 ## Notes on simulation
 
 The synthetic generator is tuned to mimic a typical screening-AI homework dataset: cancer prevalence ~0.15, very high discrimination (AUC close to 1), and imperfect calibration (the score behaves like an uncalibrated risk score rather than a well-calibrated probability).
+
+
+## Full report
+- [Markdown report](equity-evaluation-mammo-ai.md)
+- [HTML report](equity-evaluation-mammo-ai.html)
