@@ -53,7 +53,8 @@ invisible(lapply(pkgs, library, character.only = TRUE))
 ```
 
 ```{r}
-data_path <- "C:/Users/22too/OneDrive/Desktop/r_task/mammography_ai_equity_data_simulated.csv"
+
+data_path <- "mammography_ai_equity_data_simulated.csv"
 data_original <- read.csv(data_path, stringsAsFactors = FALSE)
 
 # Type casting + derived intersectional subgroup
