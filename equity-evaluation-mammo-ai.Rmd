@@ -1,13 +1,13 @@
 ---
 title: "equity-evaluation-mammo-ai"
-author: "Hyemi"
-date: "2026-02-05"
 output:
   html_document:
     toc: true
     toc_depth: 3
     number_sections: true
+    self_contained: true
 ---
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
